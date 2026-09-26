@@ -45,44 +45,27 @@ def _mt_twist(state: U32Ptr):
     )
 
 
-def _mt_next(state: U32Ptr, mut index: Int) -> UInt32:
-    if index >= 624:
-        _mt_twist(state)
-        index = 0
-    var word = state.unsafe_load(index)
-    index += 1
-    word ^= word >> UInt32(11)
-    word ^= (word << UInt32(7)) & UInt32(0x9D2C5680)
-    word ^= (word << UInt32(15)) & UInt32(0xEFC60000)
-    word ^= word >> UInt32(18)
-    return word
+comptime MT_N = 624
+comptime MT_SCALE = 1.0 / 9007199254740992.0
 
 
-def _mt_random(state: U32Ptr, mut index: Int) -> Float64:
-    var first = _mt_next(state, index) >> UInt32(5)
-    var second = _mt_next(state, index) >> UInt32(6)
-    return (
-        Float64(first) * 67108864.0 + Float64(second)
-    ) * (1.0 / 9007199254740992.0)
-
-
-@export("mdeap_fill_polynomial_random")
-def fill_polynomial_random(
-    random_addr: Int,
-    state_addr: Int,
-    n: Int,
-    indpb: Float64,
-    start_index: Int,
-) abi("C") -> Int:
-    var random_values = FPtr(unsafe_from_address=random_addr)
-    var state = U32Ptr(unsafe_from_address=state_addr)
-    var index = start_index
-    for i in range(n):
-        if _mt_random(state, index) <= indpb:
-            random_values.unsafe_store(i, _mt_random(state, index))
-        else:
-            random_values.unsafe_store(i, -1.0)
-    return index
+def _mt_refill(state: U32Ptr, words: U32Ptr):
+    # Temper a whole state block into `words` so the draw loop below reads
+    # pre-tempered words and never rewrites the caller's MT19937 state.
+    comptime W = simd_width_of[DType.uint32]()
+    comptime shift11 = SIMD[DType.uint32, W](11)
+    comptime shift7 = SIMD[DType.uint32, W](7)
+    comptime shift15 = SIMD[DType.uint32, W](15)
+    comptime shift18 = SIMD[DType.uint32, W](18)
+    comptime mask7 = SIMD[DType.uint32, W](0x9D2C5680)
+    comptime mask15 = SIMD[DType.uint32, W](0xEFC60000)
+    for i in range(0, MT_N, W):
+        var word = state.unsafe_load[width=W](i)
+        word ^= word >> shift11
+        word ^= (word << shift7) & mask7
+        word ^= (word << shift15) & mask15
+        word ^= word >> shift18
+        words.unsafe_store(i, word)
 
 
 @export("mdeap_cx_uniform_f64")
@@ -225,6 +208,34 @@ def cx_ordered(
         b.unsafe_store(i, tmp)
 
 
+
+@export("mdeap_check_permutations")
+def check_permutations(
+    a_addr: Int,
+    b_addr: Int,
+    seen1_addr: Int,
+    seen2_addr: Int,
+    n: Int,
+) abi("C") -> Int:
+    var a = IPtr(unsafe_from_address=a_addr)
+    var b = IPtr(unsafe_from_address=b_addr)
+    var seen1 = BPtr(unsafe_from_address=seen1_addr)
+    var seen2 = BPtr(unsafe_from_address=seen2_addr)
+    for i in range(n):
+        seen1.unsafe_store(i, UInt8(0))
+        seen2.unsafe_store(i, UInt8(0))
+    for i in range(n):
+        var va = Int(a.unsafe_load(i))
+        var vb = Int(b.unsafe_load(i))
+        if va < 0 or va >= n or vb < 0 or vb >= n:
+            return 0
+        if seen1.unsafe_load(va) != 0 or seen2.unsafe_load(vb) != 0:
+            return 0
+        seen1.unsafe_store(va, UInt8(1))
+        seen2.unsafe_store(vb, UInt8(1))
+    return 1
+
+
 @export("mdeap_cx_blend")
 def cx_blend(
     a_addr: Int,
@@ -334,32 +345,6 @@ def mut_gaussian(
             )
 
 
-def _polynomial_vector[W: Int](
-    x: SIMD[DType.float64, W],
-    lower: SIMD[DType.float64, W],
-    upper: SIMD[DType.float64, W],
-    rand: SIMD[DType.float64, W],
-    eta: Float64,
-) -> SIMD[DType.float64, W]:
-    var width = upper - lower
-    var delta1 = (x - lower) / width
-    var delta2 = (upper - x) / width
-    var eta_vector = SIMD[DType.float64, W](eta + 1.0)
-    var mutation_power = SIMD[DType.float64, W](1.0 / (eta + 1.0))
-    var left_xy = 1.0 - delta1
-    var left_val = (
-        2.0 * rand + (1.0 - 2.0 * rand) * left_xy**eta_vector
-    )
-    var left_delta = left_val**mutation_power - 1.0
-    var right_xy = 1.0 - delta2
-    var right_val = (
-        2.0 * (1.0 - rand) + 2.0 * (rand - 0.5) * right_xy**eta_vector
-    )
-    var right_delta = 1.0 - right_val**mutation_power
-    var delta_q = rand.lt(0.5).select(left_delta, right_delta)
-    return min(max(x + delta_q * width, lower), upper)
-
-
 def _polynomial_scalar(
     x: Float64,
     lower: Float64,
@@ -383,103 +368,135 @@ def _polynomial_scalar(
     return min(max(x + delta_q * width, lower), upper)
 
 
+# One fused pass: the MT19937 draws, the per-gene indpb decision, and the
+# mutation itself. Evaluating only the branch DEAP takes halves the number of
+# `pow` calls, which dominate this kernel by an order of magnitude.
 @export("mdeap_mut_polynomial")
 def mut_polynomial(
     values_addr: Int,
     low_addr: Int,
     up_addr: Int,
-    random_addr: Int,
-    indices_addr: Int,
-    active_count: Int,
+    words_addr: Int,
+    state_addr: Int,
+    n: Int,
+    indpb: Float64,
+    start_index: Int,
     eta: Float64,
-) abi("C"):
+) abi("C") -> Int:
     var values = FPtr(unsafe_from_address=values_addr)
     var low = FPtr(unsafe_from_address=low_addr)
     var up = FPtr(unsafe_from_address=up_addr)
-    var random_values = FPtr(unsafe_from_address=random_addr)
-    var indices = IPtr(unsafe_from_address=indices_addr)
-    comptime W = simd_width_of[DType.float64]()
-    var vector_end = (active_count // W) * W
-    for i in range(0, vector_end, W):
-        var gene_indices = indices.unsafe_load[width=W](i)
-        var x = values.unsafe_gather(gene_indices)
-        var lower = low.unsafe_gather(gene_indices)
-        var upper = up.unsafe_gather(gene_indices)
-        var rand = random_values.unsafe_gather(gene_indices)
-        values.unsafe_scatter(
-            gene_indices, _polynomial_vector(x, lower, upper, rand, eta)
-        )
-    for i in range(vector_end, active_count):
-        var gene = Int(indices.unsafe_load(i))
-        values.unsafe_store(
-            gene,
-            _polynomial_scalar(
-                values.unsafe_load(gene),
-                low.unsafe_load(gene),
-                up.unsafe_load(gene),
-                random_values.unsafe_load(gene),
-                eta,
-            ),
-        )
+    var words = U32Ptr(unsafe_from_address=words_addr)
+    var state = U32Ptr(unsafe_from_address=state_addr)
+    var pos = start_index
+    if pos == MT_N:
+        _mt_twist(state)
+        pos = 0
+    _mt_refill(state, words)
+    for i in range(n):
+        var first = words.unsafe_load(pos)
+        pos += 1
+        if pos == MT_N:
+            _mt_twist(state)
+            _mt_refill(state, words)
+            pos = 0
+        var second = words.unsafe_load(pos)
+        pos += 1
+        if pos == MT_N:
+            _mt_twist(state)
+            _mt_refill(state, words)
+            pos = 0
+        var draw = (Float64(first >> UInt32(5)) * 67108864.0 + Float64(
+            second >> UInt32(6)
+        )) * MT_SCALE
+        if draw <= indpb:
+            var third = words.unsafe_load(pos)
+            pos += 1
+            if pos == MT_N:
+                _mt_twist(state)
+                _mt_refill(state, words)
+                pos = 0
+            var fourth = words.unsafe_load(pos)
+            pos += 1
+            if pos == MT_N:
+                _mt_twist(state)
+                _mt_refill(state, words)
+                pos = 0
+            var value = (Float64(third >> UInt32(5)) * 67108864.0 + Float64(
+                fourth >> UInt32(6)
+            )) * MT_SCALE
+            values.unsafe_store(
+                i,
+                _polynomial_scalar(
+                    values.unsafe_load(i),
+                    low.unsafe_load(i),
+                    up.unsafe_load(i),
+                    value,
+                    eta,
+                ),
+            )
+    return pos
 
 
 @export("mdeap_mut_polynomial_scalar_bounds")
 def mut_polynomial_scalar_bounds(
     values_addr: Int,
-    random_addr: Int,
-    indices_addr: Int,
-    active_count: Int,
-    eta: Float64,
-    lower: Float64,
-    upper: Float64,
-) abi("C"):
-    var values = FPtr(unsafe_from_address=values_addr)
-    var random_values = FPtr(unsafe_from_address=random_addr)
-    var indices = IPtr(unsafe_from_address=indices_addr)
-    comptime W = simd_width_of[DType.float64]()
-    var vector_end = (active_count // W) * W
-    var lower_vector = SIMD[DType.float64, W](lower)
-    var upper_vector = SIMD[DType.float64, W](upper)
-    for i in range(0, vector_end, W):
-        var gene_indices = indices.unsafe_load[width=W](i)
-        var x = values.unsafe_gather(gene_indices)
-        var rand = random_values.unsafe_gather(gene_indices)
-        values.unsafe_scatter(
-            gene_indices,
-            _polynomial_vector(x, lower_vector, upper_vector, rand, eta),
-        )
-    for i in range(vector_end, active_count):
-        var gene = Int(indices.unsafe_load(i))
-        values.unsafe_store(
-            gene,
-            _polynomial_scalar(
-                values.unsafe_load(gene),
-                lower,
-                upper,
-                random_values.unsafe_load(gene),
-                eta,
-            ),
-        )
-
-
-@export("mdeap_mut_polynomial_scalar_bounds_gpu")
-def mut_polynomial_scalar_bounds_gpu(
-    values_addr: Int,
-    random_addr: Int,
-    indices_addr: Int,
+    words_addr: Int,
+    state_addr: Int,
     n: Int,
-    active_count: Int,
+    indpb: Float64,
+    start_index: Int,
     eta: Float64,
     lower: Float64,
     upper: Float64,
 ) abi("C") -> Int:
-    # This toolchain ships no GPU host API (no DeviceContext, no enqueue_*), so
-    # the `device="gpu"` entry point runs the same serial kernel on the CPU.
-    # See README: the port is CPU-only by necessity, not by oversight.
-    mut_polynomial_scalar_bounds(
-        values_addr, random_addr, indices_addr, active_count, eta, lower, upper
-    )
-    return 1
+    var values = FPtr(unsafe_from_address=values_addr)
+    var words = U32Ptr(unsafe_from_address=words_addr)
+    var state = U32Ptr(unsafe_from_address=state_addr)
+    var pos = start_index
+    if pos == MT_N:
+        _mt_twist(state)
+        pos = 0
+    _mt_refill(state, words)
+    for i in range(n):
+        var first = words.unsafe_load(pos)
+        pos += 1
+        if pos == MT_N:
+            _mt_twist(state)
+            _mt_refill(state, words)
+            pos = 0
+        var second = words.unsafe_load(pos)
+        pos += 1
+        if pos == MT_N:
+            _mt_twist(state)
+            _mt_refill(state, words)
+            pos = 0
+        var draw = (Float64(first >> UInt32(5)) * 67108864.0 + Float64(
+            second >> UInt32(6)
+        )) * MT_SCALE
+        if draw <= indpb:
+            var third = words.unsafe_load(pos)
+            pos += 1
+            if pos == MT_N:
+                _mt_twist(state)
+                _mt_refill(state, words)
+                pos = 0
+            var fourth = words.unsafe_load(pos)
+            pos += 1
+            if pos == MT_N:
+                _mt_twist(state)
+                _mt_refill(state, words)
+                pos = 0
+            var value = (Float64(third >> UInt32(5)) * 67108864.0 + Float64(
+                fourth >> UInt32(6)
+            )) * MT_SCALE
+            values.unsafe_store(
+                i,
+                _polynomial_scalar(
+                    values.unsafe_load(i), lower, upper, value, eta
+                ),
+            )
+    return pos
 
 
 @export("mdeap_mut_shuffle")

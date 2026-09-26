@@ -16,6 +16,7 @@ I = ctypes.c_int64
 F = ctypes.c_double
 
 _SIGNATURES = {
+    "mdeap_check_permutations": ([I, I, I, I, I], I),
     "mdeap_cx_uniform_f64": ([I, I, I, I], None),
     "mdeap_cx_uniform_i64": ([I, I, I, I], None),
     "mdeap_cx_uniform_u8": ([I, I, I, I], None),
@@ -26,13 +27,8 @@ _SIGNATURES = {
     "mdeap_cx_sbx": ([I, I, I, I, F], None),
     "mdeap_cx_sbx_bounded": ([I, I, I, I, I, I, I, I, F], None),
     "mdeap_mut_gaussian": ([I, I, I, I], None),
-    "mdeap_fill_polynomial_random": ([I, I, I, F, I], I),
-    "mdeap_mut_polynomial": ([I, I, I, I, I, I, F], None),
-    "mdeap_mut_polynomial_scalar_bounds": ([I, I, I, I, F, F, F], None),
-    "mdeap_mut_polynomial_scalar_bounds_gpu": (
-        [I, I, I, I, I, F, F, F],
-        I,
-    ),
+    "mdeap_mut_polynomial": ([I, I, I, I, I, I, F, I, F], I),
+    "mdeap_mut_polynomial_scalar_bounds": ([I, I, I, I, F, I, F, F, F], I),
     "mdeap_mut_shuffle": ([I, I, I], None),
     "mdeap_mut_flip": ([I, I, I], None),
     "mdeap_mut_uniform_int": ([I, I, I, I], None),

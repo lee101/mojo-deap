@@ -65,17 +65,26 @@ def _finish(*callbacks) -> None:
             callback()
 
 
-def _validate_index_permutations(first: np.ndarray, second: np.ndarray) -> None:
+_PERMUTATION_ERROR = (
+    "permutation crossover requires each individual to contain "
+    "every integer in range(len(shorter_individual)) exactly once"
+)
+
+
+def _validate_index_permutations(
+    first: np.ndarray,
+    second: np.ndarray,
+    scratch1: np.ndarray,
+    scratch2: np.ndarray,
+) -> None:
     """Keep native scratch indexing inside [0, n) for DEAP permutations."""
     size = len(first)
-    expected = np.arange(size, dtype=np.int64)
-    if not np.array_equal(np.sort(first), expected) or not np.array_equal(
-        np.sort(second), expected
+    if not size:
+        return
+    if not lib().mdeap_check_permutations(
+        addr(first), addr(second), addr(scratch1), addr(scratch2), size
     ):
-        raise ValueError(
-            "permutation crossover requires each individual to contain "
-            "every integer in range(len(shorter_individual)) exactly once"
-        )
+        raise ValueError(_PERMUTATION_ERROR)
 
 
 def _parameter(value, size: int, name: str):
@@ -168,22 +177,25 @@ def cxPartialyMatched(ind1, ind2):
     second, finish_second = _int_work(ind2, size)
     positions1 = np.empty(size, dtype=np.int64)
     positions2 = np.empty(size, dtype=np.int64)
-    _validate_index_permutations(first, second)
+    seen1 = np.empty(size, dtype=np.uint8)
+    seen2 = np.empty(size, dtype=np.uint8)
+    _validate_index_permutations(first, second, seen1, seen2)
     cxpoint1 = random.randint(0, size)
     cxpoint2 = random.randint(0, size - 1)
     if cxpoint2 >= cxpoint1:
         cxpoint2 += 1
     else:
         cxpoint1, cxpoint2 = cxpoint2, cxpoint1
-    lib().mdeap_cx_pmx(
-        addr(first),
-        addr(second),
-        addr(positions1),
-        addr(positions2),
-        size,
-        cxpoint1,
-        cxpoint2,
-    )
+    if size:
+        lib().mdeap_cx_pmx(
+            addr(first),
+            addr(second),
+            addr(positions1),
+            addr(positions2),
+            size,
+            cxpoint1,
+            cxpoint2,
+        )
     _finish(finish_first, finish_second)
     return ind1, ind2
 
@@ -194,20 +206,23 @@ def cxUniformPartialyMatched(ind1, ind2, indpb):
     second, finish_second = _int_work(ind2, size)
     positions1 = np.empty(size, dtype=np.int64)
     positions2 = np.empty(size, dtype=np.int64)
-    _validate_index_permutations(first, second)
+    seen1 = np.empty(size, dtype=np.uint8)
+    seen2 = np.empty(size, dtype=np.uint8)
+    _validate_index_permutations(first, second, seen1, seen2)
     mask = np.fromiter(
         (random.random() < indpb for _ in range(size)),
         dtype=np.uint8,
         count=size,
     )
-    lib().mdeap_cx_upmx(
-        addr(first),
-        addr(second),
-        addr(positions1),
-        addr(positions2),
-        addr(mask),
-        size,
-    )
+    if size:
+        lib().mdeap_cx_upmx(
+            addr(first),
+            addr(second),
+            addr(positions1),
+            addr(positions2),
+            addr(mask),
+            size,
+        )
     _finish(finish_first, finish_second)
     return ind1, ind2
 
@@ -219,16 +234,17 @@ def cxOrdered(ind1, ind2):
     second, finish_second = _int_work(ind2, size)
     holes1 = np.empty(size, dtype=np.uint8)
     holes2 = np.empty(size, dtype=np.uint8)
-    _validate_index_permutations(first, second)
-    lib().mdeap_cx_ordered(
-        addr(first),
-        addr(second),
-        addr(holes1),
-        addr(holes2),
-        size,
-        left,
-        right,
-    )
+    _validate_index_permutations(first, second, holes1, holes2)
+    if size:
+        lib().mdeap_cx_ordered(
+            addr(first),
+            addr(second),
+            addr(holes1),
+            addr(holes2),
+            size,
+            left,
+            right,
+        )
     _finish(finish_first, finish_second)
     return ind1, ind2
 
@@ -379,68 +395,41 @@ def mutPolynomialBounded(individual, eta, low, up, indpb, device="cpu"):
     if not size:
         _finish(finish)
         return (individual,)
+    # `device="gpu"` is retained for API compatibility. This toolchain ships
+    # no GPU host API, so the kernel runs serially on the CPU; see README,
+    # "CPU-only by necessity".
+    if device == "gpu" and values.nbytes >= 2_000_000_000:
+        raise MemoryError("GPU polynomial mutation buffers would exceed 2 GB")
     version, internal_state, gaussian = random.getstate()
     mt_state = np.asarray(internal_state[:-1], dtype=np.uint32)
-    random_values = np.empty(size, dtype=np.float64)
-    next_index = lib().mdeap_fill_polynomial_random(
-        addr(random_values),
-        addr(mt_state),
-        size,
-        indpb,
-        internal_state[-1],
-    )
+    words = np.empty(624, dtype=np.uint32)
+    if scalar_bounds:
+        next_index = lib().mdeap_mut_polynomial_scalar_bounds(
+            addr(values),
+            addr(words),
+            addr(mt_state),
+            size,
+            indpb,
+            internal_state[-1],
+            eta,
+            low,
+            up,
+        )
+    else:
+        next_index = lib().mdeap_mut_polynomial(
+            addr(values),
+            addr(lower),
+            addr(upper),
+            addr(words),
+            addr(mt_state),
+            size,
+            indpb,
+            internal_state[-1],
+            eta,
+        )
     random.setstate(
         (version, tuple(map(int, mt_state)) + (next_index,), gaussian)
     )
-    active_indices = np.flatnonzero(random_values >= 0)
-    if active_indices.size:
-        if scalar_bounds:
-            device_bytes = (
-                values.nbytes + random_values.nbytes + active_indices.nbytes
-            )
-            # `device="gpu"` is retained for API compatibility. This toolchain
-            # ships no GPU host API, so the kernel runs serially on the CPU;
-            # see README, "CPU-only by necessity".
-            if device == "gpu":
-                if device_bytes >= 2_000_000_000:
-                    raise MemoryError(
-                        "GPU polynomial mutation buffers would exceed 2 GB"
-                    )
-                status = lib().mdeap_mut_polynomial_scalar_bounds_gpu(
-                        addr(values),
-                        addr(random_values),
-                        addr(active_indices),
-                        size,
-                        active_indices.size,
-                        eta,
-                        low,
-                        up,
-                    )
-                if status != 1:
-                    raise RuntimeError(
-                        "GPU polynomial mutation failed or has insufficient "
-                        "free device memory"
-                    )
-            else:
-                lib().mdeap_mut_polynomial_scalar_bounds(
-                    addr(values),
-                    addr(random_values),
-                    addr(active_indices),
-                    active_indices.size,
-                    eta,
-                    low,
-                    up,
-                )
-        else:
-            lib().mdeap_mut_polynomial(
-                addr(values),
-                addr(lower),
-                addr(upper),
-                addr(random_values),
-                addr(active_indices),
-                active_indices.size,
-                eta,
-            )
     _finish(finish)
     return (individual,)
 
