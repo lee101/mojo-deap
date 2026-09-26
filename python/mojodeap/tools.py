@@ -398,6 +398,9 @@ def mutPolynomialBounded(individual, eta, low, up, indpb, device="cpu"):
             device_bytes = (
                 values.nbytes + random_values.nbytes + active_indices.nbytes
             )
+            # `device="gpu"` is retained for API compatibility. This toolchain
+            # ships no GPU host API, so the kernel runs serially on the CPU;
+            # see README, "CPU-only by necessity".
             if device == "gpu":
                 if device_bytes >= 2_000_000_000:
                     raise MemoryError(

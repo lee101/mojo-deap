@@ -69,7 +69,7 @@ tools.mutGaussianBatch(left, mu=0.0, sigma=0.1, indpb=0.05, rng=rng)
 
 Batch inputs must be writable, C-contiguous `float64` arrays.
 
-Polynomial mutation also has an explicit GPU path for scalar bounds:
+`mutPolynomialBounded` also accepts `device="gpu"` for scalar bounds:
 
 ```python
 tools.mutPolynomialBounded(
@@ -82,10 +82,24 @@ tools.mutPolynomialBounded(
 )
 ```
 
-CPU remains the default. The GPU path is only attempted when explicitly
-requested. It raises an exception if the device is unavailable, has
-insufficient free memory, or execution fails; it never silently substitutes a
-CPU result.
+### CPU-only by necessity
+
+**This port runs on the CPU, and every kernel is serial.** That is a property
+of the pinned toolchain, not a choice:
+
+- `parallelize` and the whole `std.parallelism` module no longer exist. There
+  is no CPU-parallel primitive in the standard library to port the crossover
+  and mutation loops onto, so those loops stay serial rather than growing a
+  bespoke threading API.
+- The GPU host API is gone as well: `DeviceContext` is not in `std.gpu.host`,
+  `std.gpu`, or anywhere else, so `enqueue_create_buffer`, `enqueue_copy`,
+  `enqueue_function`, and `synchronize` are unavailable.
+
+Consequently `device="gpu"` is retained for API compatibility but runs the
+same serial kernel as `device="cpu"`. It performs the same work and returns
+the same values; it does not use a GPU. No replacement GPU API was invented to
+paper over this. Vectorization survives: the polynomial kernels gather,
+evaluate, and scatter four `float64` lanes at a time.
 
 ## Coverage
 
@@ -114,7 +128,7 @@ outputs and the next RNG value after each seeded call. Discrete operators match
 exactly. Floating-point parity checks use explicit tolerances because Mojo and
 CPython can round fractional powers differently. Tests also cover NumPy fast
 paths, vector bounds, SIMD remainders, empty buffers, invalid permutation
-values, dtype overflow, batch formulas, and the GPU result when available.
+values, dtype overflow, batch formulas, and the `device="gpu"` entry point.
 
 ## Benchmarks
 
@@ -124,11 +138,11 @@ three warmed runs and include input copies and random-number generation.
 
 | operator | mojo-deap | DEAP 1.4 | speedup |
 | --- | ---: | ---: | ---: |
-| PMX permutation crossover, 500k genes | 66.4 ms | 728.7 ms | 10.97x |
-| BLX-alpha batch, 2m genes | 73.7 ms | 1493.5 ms | 20.27x |
-| SBX batch, 2m genes | 200.3 ms | 2784.6 ms | 13.90x |
-| Gaussian mutation batch, 2m genes | 91.9 ms | 920.9 ms | 10.02x |
-| Polynomial mutation, 500k genes | 15.2 ms | 179.3 ms | 11.79x |
+| PMX permutation crossover, 500k genes | 67.6 ms | 1158.3 ms | 17.13x |
+| BLX-alpha batch, 2m genes | 56.5 ms | 4888.4 ms | 86.59x |
+| SBX batch, 2m genes | 239.3 ms | 10110.3 ms | 42.25x |
+| Gaussian mutation batch, 2m genes | 118.1 ms | 1302.4 ms | 11.02x |
+| Polynomial mutation, 500k genes | 52.8 ms | 474.7 ms | 9.00x |
 
 The batch comparisons apply upstream DEAP once per population row, which is
 the normal DEAP usage. The batch API uses NumPy's generator while upstream uses
@@ -142,9 +156,8 @@ Python owns every input, output, random-value, mask, and scratch array. The
 ctypes layer validates native dtypes, contiguity, lengths, writable status, and
 non-null buffers before passing addresses across a C ABI into one Mojo
 compilation unit. Each NumPy owner remains live for the full synchronous call.
-CPU exports reconstruct mutable typed pointers and never retain them. The
-optional GPU export uses short-lived device buffers and releases them before
-returning.
+CPU exports reconstruct mutable typed pointers from `Int` addresses and never
+retain them. There is no device path, so there are no device buffers.
 
 Continuous values are row-major `float64`, permutation and integer values are
 `int64`, and Boolean masks are one-byte `uint8`. Standard list inputs are
