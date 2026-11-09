@@ -135,15 +135,18 @@ values, dtype overflow, batch formulas, and the `device="gpu"` entry point.
 Measured by `pixi run bench` in this session (reproduced 2026-11-09) on
 this machine: Intel(R) Xeon(R) CPU E5-2697 v4 @ 2.30GHz, Linux x86-64.
 Times are the best of three warmed runs and include input copies and
-random-number generation. See `bench/verify.md` for the verification record.
+random-number generation. Numbers below are not preserved from earlier
+phases: they are the values measured in this VERIFY session (run 4 of
+4, see `bench/verify.md` for the verification record and spread across
+runs).
 
 | operator | mojo-deap | DEAP 1.4 | speedup |
 | --- | ---: | ---: | ---: |
-| PMX permutation crossover, 500k genes | 16.2 ms | 490.3 ms | 30.23x |
-| BLX-alpha batch, 2m genes | 36.5 ms | 1939.3 ms | 53.17x |
-| SBX batch, 2m genes | 119.3 ms | 2862.5 ms | 23.99x |
-| Gaussian mutation batch, 2m genes | 54.5 ms | 553.0 ms | 10.15x |
-| Polynomial mutation, 500k genes | 15.0 ms | 229.0 ms | 15.22x |
+| PMX permutation crossover, 500k genes | 13.0 ms | 508.1 ms | 39.13x |
+| BLX-alpha batch, 2m genes | 34.7 ms | 2325.2 ms | 66.98x |
+| SBX batch, 2m genes | 121.1 ms | 3431.9 ms | 28.33x |
+| Gaussian mutation batch, 2m genes | 56.3 ms | 555.2 ms | 9.86x |
+| Polynomial mutation, 500k genes | 14.5 ms | 228.9 ms | 15.78x |
 
 The batch comparisons apply upstream DEAP once per population row, which is
 the normal DEAP usage. The batch API uses NumPy's generator while upstream uses
