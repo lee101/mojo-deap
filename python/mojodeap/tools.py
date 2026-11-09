@@ -266,6 +266,11 @@ def cxBlend(ind1, ind2, alpha):
 
 def cxSimulatedBinary(ind1, ind2, eta):
     size = min(len(ind1), len(ind2))
+    # Match deap.tools.cxSimulatedBinary: beta **= 1./(eta+1.) raises
+    # ZeroDivisionError after drawing the first gene's rand when eta == -1.
+    if size and eta == -1:
+        random.random()
+        raise ZeroDivisionError("float division by zero")
     first, finish_first = _float_work(ind1, size)
     second, finish_second = _float_work(ind2, size)
     random_values = np.fromiter(
@@ -290,6 +295,11 @@ def cxSimulatedBinaryBounded(ind1, ind2, eta, low, up):
     random_values = np.zeros(size, dtype=np.float64)
     for index in range(size):
         if random.random() <= 0.5 and abs(first[index] - second[index]) > 1e-14:
+            # Match deap.tools.cxSimulatedBinaryBounded: an active gene
+            # with eta == -1 raises ZeroDivisionError after its rand draw.
+            if eta == -1:
+                random.random()
+                raise ZeroDivisionError("float division by zero")
             active[index] = 1
             random_values[index] = random.random()
             swaps[index] = random.random() <= 0.5
@@ -395,6 +405,33 @@ def mutPolynomialBounded(individual, eta, low, up, indpb, device="cpu"):
     if not size:
         _finish(finish)
         return (individual,)
+    # Match deap.tools.mutPolynomialBounded: an active gene raises
+    # ZeroDivisionError when eta == -1 (1./(eta+1.), after its rand draw)
+    # or when its width is zero ((x-xl)/(xu-xl), before the rand draw).
+    _zero_width = (
+        np.zeros(size, dtype=bool)
+        if scalar_bounds
+        else (lower == upper)
+    )
+    if eta == -1 or _zero_width.any():
+        _saved = random.getstate()
+        try:
+            for index in range(size):
+                if random.random() <= indpb:
+                    _width = (
+                        float(up) - float(low)
+                        if scalar_bounds
+                        else float(upper[index] - lower[index])
+                    )
+                    if _width == 0.0:
+                        raise ZeroDivisionError("float division by zero")
+                    random.random()
+                    if eta == -1:
+                        raise ZeroDivisionError("float division by zero")
+        except ZeroDivisionError:
+            raise
+        else:
+            random.setstate(_saved)
     # `device="gpu"` is retained for API compatibility. This toolchain ships
     # no GPU host API, so the kernel runs serially on the CPU; see README,
     # "CPU-only by necessity".
@@ -436,6 +473,21 @@ def mutPolynomialBounded(individual, eta, low, up, indpb, device="cpu"):
 
 def mutShuffleIndexes(individual, indpb):
     size = len(individual)
+    if not isinstance(individual, np.ndarray) or not np.issubdtype(
+        individual.dtype, np.integer
+    ):
+        # Match deap.tools.mutShuffleIndexes: swaps are value-agnostic, so
+        # lists and non-integer arrays (str/float/NaN) swap in Python.
+        for index in range(size):
+            if random.random() < indpb:
+                swap_index = random.randint(0, size - 2)
+                if swap_index >= index:
+                    swap_index += 1
+                individual[index], individual[swap_index] = (
+                    individual[swap_index],
+                    individual[index],
+                )
+        return (individual,)
     values, finish = _int_work(individual)
     targets = np.full(size, -1, dtype=np.int64)
     for index in range(size):
@@ -490,6 +542,15 @@ def mutUniformInt(individual, low, up, indpb):
         )
     else:
         upper = up
+    if not isinstance(individual, np.ndarray) or not np.issubdtype(
+        individual.dtype, np.integer
+    ):
+        # Match deap.tools.mutUniformInt: only mutated genes are replaced,
+        # so non-integer elements keep their value/type (no int64 cast).
+        for index, lo, hi in zip(range(size), lower, upper):
+            if random.random() < indpb:
+                individual[index] = random.randint(lo, hi)
+        return (individual,)
     values, finish = _int_work(individual)
     active = np.zeros(size, dtype=np.uint8)
     replacements = np.zeros(size, dtype=np.int64)
@@ -522,6 +583,21 @@ def mutESLogNormal(individual, c, indpb):
     t = c / math.sqrt(2.0 * math.sqrt(size))
     t0 = c / math.sqrt(2.0 * size)
     common = t0 * random.gauss(0, 1)
+    # Match deap.tools.mutESLogNormal: an active gene at or beyond a short
+    # strategy raises IndexError after its first gauss draw.
+    if len(individual.strategy) < size:
+        _saved = random.getstate()
+        try:
+            for index in range(size):
+                if random.random() < indpb:
+                    random.gauss(0, 1)
+                    if index >= len(individual.strategy):
+                        raise IndexError("list index out of range")
+                    random.gauss(0, 1)
+        except IndexError:
+            raise
+        else:
+            random.setstate(_saved)
     values, finish_values = _float_work(individual)
     strategy, finish_strategy = _float_work(individual.strategy)
     active = np.zeros(size, dtype=np.uint8)

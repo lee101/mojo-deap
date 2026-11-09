@@ -318,8 +318,12 @@ def cx_sbx_bounded(
         if rand > 1.0 / coeff:
             beta_q = (1.0 / (2.0 - rand * coeff)) ** power
         var c2 = 0.5 * (first + second + beta_q * width)
-        c1 = min(max(c1, low.unsafe_load(i)), up.unsafe_load(i))
-        c2 = min(max(c2, low.unsafe_load(i)), up.unsafe_load(i))
+        # Match deap.tools.cxSimulatedBinaryBounded: Python's min(max(...))
+        # propagates NaN, Mojo's min/max would clamp it to a bound.
+        if c1 == c1:
+            c1 = min(max(c1, low.unsafe_load(i)), up.unsafe_load(i))
+        if c2 == c2:
+            c2 = min(max(c2, low.unsafe_load(i)), up.unsafe_load(i))
         if swaps.unsafe_load(i) != 0:
             a.unsafe_store(i, c2)
             b.unsafe_store(i, c1)
@@ -365,7 +369,12 @@ def _polynomial_scalar(
             2.0 * (1.0 - rand) + 2.0 * (rand - 0.5) * xy ** (eta + 1.0)
         )
         delta_q = 1.0 - val**mutation_power
-    return min(max(x + delta_q * width, lower), upper)
+    # Match deap.tools.mutPolynomialBounded: Python's min(max(v, xl), xu)
+    # propagates NaN (e.g. a NaN/inf gene), Mojo's min/max would clamp it.
+    var raw = x + delta_q * width
+    if raw != raw:
+        return raw
+    return min(max(raw, lower), upper)
 
 
 # One fused pass: the MT19937 draws, the per-gene indpb decision, and the
